@@ -243,6 +243,34 @@ report_stage '{"stage":"install_runtime","progress_pct":65}'
 # upstream launcher's post-install fix-up).
 "$PIP" install --no-deps --force-reinstall "protobuf>=4.25.0" >/dev/null 2>&1 || true
 
+# resemble-perth ships PerthImplicitWatermarker as None in this environment
+# (its __init__ swallows an internal import error), so chatterbox's
+# constructor — self.watermarker = perth.PerthImplicitWatermarker() — dies
+# with "'NoneType' object is not callable". Watermarking is provenance-only
+# and irrelevant for a rent-the-GPU product (the customer runs their own
+# generation), so substitute a no-op when perth is broken. A sitecustomize.py
+# in the venv is auto-imported by EVERY python process (our warm script AND
+# the server's from_pretrained at startup), so the patch can't be missed.
+SITE_PACKAGES="$("$PY" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || echo "${VENV_DIR}/lib/python${PYVERSION}/site-packages")"
+cat > "${SITE_PACKAGES}/sitecustomize.py" <<'PYEOF'
+try:
+    import perth
+
+    if getattr(perth, "PerthImplicitWatermarker", None) is None:
+        class _NoopWatermarker:
+            def apply_watermark(self, wav, sample_rate=None, **kwargs):
+                return wav
+
+            def get_watermark(self, *args, **kwargs):
+                return None
+
+        perth.PerthImplicitWatermarker = _NoopWatermarker
+except Exception:
+    # Never let the shim break interpreter startup; a working perth is used
+    # as-is, and any unexpected error here just leaves the original behaviour.
+    pass
+PYEOF
+
 report_stage '{"stage":"install_runtime","progress_pct":85}'
 
 # Point the server at the multilingual engine + Russian default. These are
