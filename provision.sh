@@ -161,7 +161,41 @@ setup_python() {
     [ -x "$PIP" ] || fail "pip из venv не найден: ${PIP}"
 }
 
-mkdir -p "$APP_DIR" "$HF_HOME"
+# clone_server
+#
+# Fetch the pinned server fork into $APP_DIR. MUST run before setup_python:
+# the venv lives at $APP_DIR/venv, and `git clone` refuses a non-empty target.
+# Retries a few times (network blips), then falls back to a tarball download
+# (codeload, a different path) if git transport is the problem. Captures the
+# real error into the failure message so we don't need SSH to diagnose.
+clone_server() {
+    local clog="/var/log/cc-tts-clone.log"
+    local n
+    for n in 1 2 3; do
+        rm -rf "$APP_DIR"
+        if git clone "$SERVER_REPO" "$APP_DIR" >"$clog" 2>&1 \
+            && git -C "$APP_DIR" checkout --quiet "$SERVER_SHA" >>"$clog" 2>&1; then
+            return 0
+        fi
+        log "git clone attempt ${n} failed; retrying"
+        sleep 3
+    done
+
+    log "git clone failed 3x; trying tarball download"
+    rm -rf "$APP_DIR" /tmp/cc-server.tgz
+    if curl -fsSL "https://codeload.github.com/cloudcompute-ru/Chatterbox-TTS-Server/tar.gz/${SERVER_SHA}" \
+            -o /tmp/cc-server.tgz >>"$clog" 2>&1 \
+        && tar -xzf /tmp/cc-server.tgz -C /tmp >>"$clog" 2>&1; then
+        mv "/tmp/Chatterbox-TTS-Server-${SERVER_SHA}" "$APP_DIR"
+        return 0
+    fi
+
+    local tail_msg
+    tail_msg="$(tail -c 500 "$clog" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')" || true
+    fail "Не удалось склонировать сервер синтеза речи: ${tail_msg}"
+}
+
+mkdir -p "$HF_HOME"
 
 # --- stage 1: install_runtime --------------------------------------------
 
@@ -177,20 +211,16 @@ apt-get install -y --no-install-recommends ffmpeg libsndfile1 git curl >/dev/nul
 
 report_stage '{"stage":"install_runtime","progress_pct":15}'
 
-# Pinned Python 3.10 venv (see header). Decouples us from the base image's
-# python, which may be 3.14 and wheel-less for torch / onnx.
-setup_python
+# Clone the server fork at its pinned commit FIRST (before the venv, which
+# lives inside $APP_DIR — git clone needs an empty target). A floating tag
+# could break launches if upstream changes; the SHA makes it reproducible.
+clone_server
 
 report_stage '{"stage":"install_runtime","progress_pct":25}'
 
-# Clone the server fork at its pinned commit. A floating tag could break
-# launches if upstream changes; the SHA makes provisioning reproducible.
-if [ ! -d "${APP_DIR}/.git" ]; then
-    git clone --filter=blob:none "$SERVER_REPO" "$APP_DIR" \
-        || fail "Не удалось склонировать сервер синтеза речи. Проверьте сеть и попробуйте снова."
-fi
-git -C "$APP_DIR" checkout --quiet "$SERVER_SHA" \
-    || fail "Не удалось переключиться на закреплённую версию сервера (${SERVER_SHA})."
+# Pinned Python 3.10 venv (see header). Decouples us from the base image's
+# python, which may be 3.14 and wheel-less for torch / onnx.
+setup_python
 
 report_stage '{"stage":"install_runtime","progress_pct":35}'
 
