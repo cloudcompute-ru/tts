@@ -6,22 +6,35 @@
 # Runs on the GPU instance after the container starts. The customer app's
 # onstart wrapper exports these env vars before invoking us:
 #
-#   CC_PROVISION_URL       POST endpoint for stage updates
-#                          (e.g. https://app.cloudcompute.ru/api/agent/provision)
-#   CC_AGENT_TOKEN         bearer token authenticating us to that endpoint
-#   CC_APP_MODEL           which TTS engine to install + warm:
-#                          xtts-v2 (default) | f5-tts | chatterbox
-#   CC_MODEL_DISPLAY_NAME  human-facing preset id, used only in log lines
+#   CC_PROVISION_URL   POST endpoint for stage updates
+#                      (e.g. https://app.cloudcompute.ru/api/agent/provision)
+#   CC_AGENT_TOKEN     bearer token authenticating us to that endpoint
 #
-# All are optional — if CC_PROVISION_URL / CC_AGENT_TOKEN are absent,
-# report_stage is a silent no-op so the script still works for local manual
-# testing (`bash provision.sh` inside a fresh container).
+# Both are optional — if absent, report_stage is a silent no-op so the script
+# still works for local manual testing (`bash provision.sh` inside a fresh
+# container).
+#
+# WHAT THIS DEPLOYS
+# -----------------
+# We self-host Resemble AI's Chatterbox TTS family via the community
+# Chatterbox-TTS-Server (forked into our org for stability, pinned by SHA):
+#
+#   cloudcompute-ru/Chatterbox-TTS-Server   the FastAPI server + Web UI
+#   cloudcompute-ru/chatterbox-v2           the model package (--no-deps)
+#
+# It ships a Web UI with an engine dropdown (Original / Multilingual / Turbo)
+# and a language dropdown, voice cloning, predefined voices, and an
+# OpenAI-compatible API. We default the engine to **Chatterbox Multilingual**
+# (23 languages incl. Russian, zero-shot voice cloning, MIT-licensed) so the
+# Russian-first audience gets a working default; the user can hot-swap to
+# Original/Turbo in the UI without a restart. This replaced the previous
+# hand-rolled Gradio app + XTTS-v2 (abandoned, CPML, torch-hostile) + F5-TTS.
 #
 # Stage IDs reported here MUST match config/applications.php's
 # provisioning.stages for the `tts` slug:
-#   install_runtime  engine + Gradio installed
-#   download_model   model weights present in the HF cache
-#   start_server     Gradio serving HTTP on :7860 (final port check)
+#   install_runtime  server cloned + Python deps installed
+#   download_model   default model weights warmed into the HF cache
+#   start_server     server serving HTTP on :8004 (final port check)
 #
 # stdout/stderr go to /var/log/cc-provision.log (the onstart wrapper sets
 # this up via `nohup ... > /var/log/cc-provision.log 2>&1 &`).
@@ -30,37 +43,40 @@
 # ----------------------------
 # We deliberately do NOT use the base image's `python3`. Vast.ai's
 # `jupyter-pytorch` template floats its tag and has shipped images as new as
-# Python 3.14 / CUDA 13.2, for which coqui-tts / torch have no wheels (the
-# install then fails or tries to build from source for ~forever). To stay
-# decoupled from whatever the host pulled, we create our own venv pinned to
-# Python 3.11 via `uv` (which downloads a standalone CPython), and install +
-# run everything inside it.
+# Python 3.14 / CUDA 13.2, for which the TTS deps (torch, onnx) have no
+# wheels. To stay decoupled from whatever the host pulled, we create our own
+# seeded venv pinned to Python 3.10 (the only version with prebuilt wheels for
+# the whole dependency set) via `uv`, and install + run everything inside it.
 
 set -euo pipefail
 
 CC_PROVISION_URL="${CC_PROVISION_URL:-}"
 CC_AGENT_TOKEN="${CC_AGENT_TOKEN:-}"
 
-# Engine selection. The customer app passes the chosen curated preset's
-# `model` key; default to XTTS-v2 (multilingual, the app default) when run
-# standalone with no env.
-ENGINE="${CC_APP_MODEL:-xtts-v2}"
-MODEL_DISPLAY_NAME="${CC_MODEL_DISPLAY_NAME:-$ENGINE}"
+# --- pinned upstream (our forks, pinned by commit) ------------------------
+SERVER_REPO="https://github.com/cloudcompute-ru/Chatterbox-TTS-Server.git"
+SERVER_SHA="915ae289340e10c6047f27f47e22eae9bf350c32"
+# chatterbox model package, installed with --no-deps so it can't downgrade the
+# CUDA torch wheels we install from requirements-nvidia-cu128.txt.
+CHATTERBOX_PKG="git+https://github.com/cloudcompute-ru/chatterbox-v2.git@cc0357396d9c73fc1e6c544ee40bb596020edd09"
 
-TTS_PORT="${TTS_PORT:-7860}"
+# Default in-UI engine. The server resolves this config value to the model
+# class (see engine.py's MODEL_SELECTORS): chatterbox-multilingual → the
+# 23-language ChatterboxMultilingualTTS. Override the runtime default via the
+# engine dropdown in the Web UI.
+DEFAULT_MODEL="chatterbox-multilingual"
+DEFAULT_LANGUAGE="ru"
+
+TTS_PORT="${TTS_PORT:-8004}"
 APP_DIR="${APP_DIR:-/workspace/cc-tts}"
-APP_FILE="${APP_DIR}/app.py"
 VENV_DIR="${APP_DIR}/venv"
-PYVERSION="${CC_TTS_PYTHON_VERSION:-3.11}"
+PYVERSION="${CC_TTS_PYTHON_VERSION:-3.10}"
 
-# Pinned venv interpreter. Populated by setup_python; every install/run below
-# goes through this, never the base image's python3.
+# Populated by setup_python; every install/run below goes through these,
+# never the base image's python3.
 PY=""
+PIP=""
 
-# XTTS-v2 weights are gated behind Coqui's CPML license prompt; agreeing
-# non-interactively is required for an unattended download. This only
-# affects local model use (which is exactly the rent-the-GPU case).
-export COQUI_TOS_AGREED=1
 # Keep the HF cache on the (large) workspace disk, not the small container
 # root, so big checkpoints don't fill / and crash the box.
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
@@ -101,7 +117,7 @@ log() {
 # non-empty `message` on provision_state is the backend's signal to flip the
 # instance to ERROR immediately (Instance::hasApplicationProvisioningFailed),
 # so the user sees a real error instead of the stepper hanging until the
-# 30-min overall timeout.
+# overall timeout.
 fail() {
     local msg="$1"
     log "FAILED at stage=${CURRENT_STAGE}: ${msg}"
@@ -113,15 +129,18 @@ fail() {
 }
 
 # Any unhandled non-zero command under `set -e` lands here. Stages that do
-# their own error handling wrap the risky bit in `set +e ... set -e`, so this
-# trap only fires for genuinely unexpected failures.
+# their own error handling wrap the risky bit in an `if` (exempt from errexit
+# AND this trap), so the trap only fires for genuinely unexpected failures.
 trap 'fail "Установка прервана на этапе ${CURRENT_STAGE}. Подробности в /var/log/cc-provision.log на инстансе."' ERR
 
 # setup_python
 #
-# Install uv (if absent) and create a Python ${PYVERSION} venv at $VENV_DIR.
-# uv downloads a standalone CPython, so we get a known-good interpreter no
-# matter what the base image ships. Sets global $PY to the venv python.
+# Install uv (if absent) and create a seeded Python ${PYVERSION} venv at
+# $VENV_DIR. uv downloads a standalone CPython, so we get a known-good
+# interpreter no matter what the base image ships. --seed installs pip so we
+# can use the upstream's exact pip-based install flow (pip natively honours
+# the --extra-index-url lines inside the requirements files). Sets global $PY
+# / $PIP to the venv interpreter + pip.
 setup_python() {
     if ! command -v uv >/dev/null 2>&1; then
         log "installing uv"
@@ -132,176 +151,75 @@ setup_python() {
     fi
     command -v uv >/dev/null 2>&1 || fail "uv не найден в PATH после установки."
 
-    log "creating Python ${PYVERSION} venv at ${VENV_DIR}"
-    uv venv --python "${PYVERSION}" "${VENV_DIR}" \
+    log "creating seeded Python ${PYVERSION} venv at ${VENV_DIR}"
+    uv venv --seed --python "${PYVERSION}" "${VENV_DIR}" \
         || fail "Не удалось создать виртуальное окружение Python ${PYVERSION}."
 
     PY="${VENV_DIR}/bin/python"
+    PIP="${VENV_DIR}/bin/pip"
     [ -x "$PY" ] || fail "Python из venv не найден: ${PY}"
+    [ -x "$PIP" ] || fail "pip из venv не найден: ${PIP}"
 }
-
-# uvpip <pip-args...> — install into our pinned venv via uv's fast resolver.
-uvpip() {
-    uv pip install --python "$PY" "$@"
-}
-
-# write_app_py
-#
-# Emits the Gradio app we drive ourselves (XTTS-v2 and Chatterbox). The
-# heredoc is single-quoted so bash leaves the Python untouched; the script
-# reads its engine + port from the same env the customer app exported.
-# F5-TTS is excluded — it ships its own Gradio UI (f5-tts_infer-gradio).
-write_app_py() {
-    cat > "$APP_FILE" <<'PYEOF'
-import os
-
-import gradio as gr
-
-ENGINE = os.environ.get("CC_APP_MODEL", "xtts-v2")
-PORT = int(os.environ.get("TTS_PORT", "7860"))
-OUT_PATH = "/tmp/cc-tts-out.wav"
-
-REF_HINT = (
-    "Загрузите чистый образец голоса 10–15 секунд: один говорящий, "
-    "без музыки и фонового шума — от качества образца зависит результат."
-)
-
-if ENGINE == "chatterbox":
-    import torch
-    import torchaudio
-
-    # chatterbox hard-calls perth.PerthImplicitWatermarker() in its
-    # constructor, but resemble-perth resolves that class to None in some
-    # environments (its __init__ swallows an internal import error), which
-    # crashes from_pretrained with "'NoneType' object is not callable".
-    # Watermarking is provenance-only and irrelevant for a rent-the-GPU
-    # product (the customer runs their own generation), so fall back to a
-    # no-op watermarker when perth is broken. Guarded so a working perth is
-    # still used if present.
-    import perth
-    if getattr(perth, "PerthImplicitWatermarker", None) is None:
-        class _NoopWatermarker:
-            def apply_watermark(self, wav, sample_rate=None, **kwargs):
-                return wav
-
-            def get_watermark(self, *args, **kwargs):
-                return None
-
-        perth.PerthImplicitWatermarker = _NoopWatermarker
-
-    from chatterbox.tts import ChatterboxTTS
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ChatterboxTTS.from_pretrained(device=device)
-
-    def synth(text, ref_audio):
-        if not text or not text.strip():
-            raise gr.Error("Введите текст для синтеза.")
-        wav = model.generate(text, audio_prompt_path=ref_audio) if ref_audio else model.generate(text)
-        torchaudio.save(OUT_PATH, wav, model.sr)
-        return OUT_PATH
-
-    with gr.Blocks(title="CloudCompute TTS — Chatterbox") as demo:
-        gr.Markdown("## Chatterbox — синтез речи и клонирование голоса\n" + REF_HINT)
-        text = gr.Textbox(label="Текст", lines=4)
-        ref = gr.Audio(label="Образец голоса (необязательно)", type="filepath")
-        out = gr.Audio(label="Результат")
-        gr.Button("Синтезировать", variant="primary").click(synth, [text, ref], out)
-else:
-    import torch
-    from TTS.api import TTS
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-    LANGS = [
-        "ru", "en", "ar", "es", "fr", "de", "it", "pt", "pl", "tr",
-        "nl", "cs", "zh-cn", "ja", "hu", "ko", "hi",
-    ]
-
-    def synth(text, ref_audio, language):
-        if not text or not text.strip():
-            raise gr.Error("Введите текст для синтеза.")
-        if not ref_audio:
-            raise gr.Error("XTTS-v2 требует образец голоса для клонирования.")
-        tts.tts_to_file(text=text, speaker_wav=ref_audio, language=language, file_path=OUT_PATH)
-        return OUT_PATH
-
-    with gr.Blocks(title="CloudCompute TTS — XTTS-v2") as demo:
-        gr.Markdown("## XTTS-v2 — мультиязычный синтез речи с клонированием голоса\n" + REF_HINT)
-        text = gr.Textbox(label="Текст", lines=4)
-        ref = gr.Audio(label="Образец голоса", type="filepath")
-        language = gr.Dropdown(LANGS, value="ru", label="Язык")
-        out = gr.Audio(label="Результат")
-        gr.Button("Синтезировать", variant="primary").click(synth, [text, ref, language], out)
-
-demo.queue().launch(server_name="0.0.0.0", server_port=PORT, show_api=False)
-PYEOF
-}
-
-case "$ENGINE" in
-    xtts-v2|f5-tts|chatterbox) ;;
-    *)
-        log "unknown engine '$ENGINE', falling back to xtts-v2"
-        ENGINE="xtts-v2"
-        ;;
-esac
 
 mkdir -p "$APP_DIR" "$HF_HOME"
 
 # --- stage 1: install_runtime --------------------------------------------
 
 CURRENT_STAGE="install_runtime"
-log "stage: install_runtime (engine=${ENGINE}, preset=${MODEL_DISPLAY_NAME})"
+log "stage: install_runtime"
 report_stage '{"stage":"install_runtime","progress_pct":0}'
 
-# System libs every engine needs: ffmpeg for audio I/O, libsndfile for
-# soundfile, git for pip VCS installs, curl for the uv installer.
+# System libs the server needs: ffmpeg for audio I/O, libsndfile for
+# soundfile, git for the clone + VCS pip install, curl for the uv installer.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y --no-install-recommends ffmpeg libsndfile1 git curl >/dev/null 2>&1 || true
 
-report_stage '{"stage":"install_runtime","progress_pct":20}'
+report_stage '{"stage":"install_runtime","progress_pct":15}'
 
-# Pinned Python 3.11 venv (see header). Decouples us from the base image's
-# python, which may be 3.14 and wheel-less for torch / coqui-tts.
+# Pinned Python 3.10 venv (see header). Decouples us from the base image's
+# python, which may be 3.14 and wheel-less for torch / onnx.
 setup_python
 
-report_stage '{"stage":"install_runtime","progress_pct":40}'
+report_stage '{"stage":"install_runtime","progress_pct":25}'
 
-# Torch first, from the official CUDA 12.4 wheel index. Newer NVIDIA drivers
-# (incl. the CUDA 13.x hosts) run cu124 runtime fine via backward compat, and
-# cu124 has stable py311 wheels for every engine below.
-uvpip torch torchaudio --index-url https://download.pytorch.org/whl/cu124 \
-    || fail "Не удалось установить PyTorch. Удалите инстанс и попробуйте другой сервер."
-
-report_stage '{"stage":"install_runtime","progress_pct":60}'
-
-# Engine-specific Python deps.
-case "$ENGINE" in
-    xtts-v2)
-        # `coqui-tts` is the maintained community fork of the (archived)
-        # original Coqui `TTS` package; same `from TTS.api import TTS`.
-        uvpip "coqui-tts>=0.24" "gradio>=4.44,<6" soundfile \
-            || fail "Не удалось установить движок XTTS-v2. Удалите инстанс и попробуйте снова."
-        ;;
-    f5-tts)
-        # F5-TTS ships its own Gradio app (`f5-tts_infer-gradio`).
-        uvpip f5-tts \
-            || fail "Не удалось установить движок F5-TTS. Удалите инстанс и попробуйте снова."
-        ;;
-    chatterbox)
-        uvpip chatterbox-tts "gradio>=4.44,<6" soundfile \
-            || fail "Не удалось установить движок Chatterbox. Удалите инстанс и попробуйте снова."
-        ;;
-esac
-
-report_stage '{"stage":"install_runtime","progress_pct":80}'
-
-# Write the Gradio UI for the engines we drive ourselves (XTTS-v2,
-# Chatterbox). F5-TTS uses its own bundled UI so it needs no app.py.
-if [ "$ENGINE" != "f5-tts" ]; then
-    write_app_py
+# Clone the server fork at its pinned commit. A floating tag could break
+# launches if upstream changes; the SHA makes provisioning reproducible.
+if [ ! -d "${APP_DIR}/.git" ]; then
+    git clone --filter=blob:none "$SERVER_REPO" "$APP_DIR" \
+        || fail "Не удалось склонировать сервер синтеза речи. Проверьте сеть и попробуйте снова."
 fi
+git -C "$APP_DIR" checkout --quiet "$SERVER_SHA" \
+    || fail "Не удалось переключиться на закреплённую версию сервера (${SERVER_SHA})."
+
+report_stage '{"stage":"install_runtime","progress_pct":35}'
+
+# CUDA torch stack first, from the cu128 wheel set (torch 2.9.0). cu128
+# covers Turing→Blackwell (incl. RTX 50-series, sm_120) in one wheel set;
+# newer Vast hosts run it fine via driver forward-compat. pip reads the
+# --extra-index-url pin from the requirements file natively.
+"$PIP" install --no-warn-script-location -r "${APP_DIR}/requirements-nvidia-cu128.txt" \
+    || fail "Не удалось установить зависимости (PyTorch CUDA). Удалите инстанс и попробуйте другой сервер."
+
+report_stage '{"stage":"install_runtime","progress_pct":65}'
+
+# Chatterbox model package + s3tokenizer + onnx with --no-deps so pip can't
+# replace the cu128 torch wheels with CPU-only ones (s3tokenizer/onnx are
+# pulled here to dodge the protobuf<3.20 vs onnx protobuf>=3.20 conflict).
+"$PIP" install --no-deps "$CHATTERBOX_PKG" s3tokenizer==0.3.0 onnx==1.16.0 \
+    || fail "Не удалось установить пакет Chatterbox. Удалите инстанс и попробуйте снова."
+
+# onnx 1.16.0 drags in an old protobuf; force a modern one (matches the
+# upstream launcher's post-install fix-up).
+"$PIP" install --no-deps --force-reinstall "protobuf>=4.25.0" >/dev/null 2>&1 || true
+
+report_stage '{"stage":"install_runtime","progress_pct":85}'
+
+# Point the server at the multilingual engine + Russian default. These are
+# the only two values we override in the shipped config.yaml; everything else
+# (host 0.0.0.0, port 8004, no auth) already matches what we need.
+sed -i 's#^\([[:space:]]*\)repo_id:.*#\1repo_id: '"$DEFAULT_MODEL"'#' "${APP_DIR}/config.yaml" || true
+sed -i 's#^\([[:space:]]*\)language: en\b#\1language: '"$DEFAULT_LANGUAGE"'#' "${APP_DIR}/config.yaml" || true
 
 report_stage '{"stage":"install_runtime","progress_pct":100}'
 
@@ -311,73 +229,32 @@ CURRENT_STAGE="download_model"
 log "stage: download_model"
 report_stage '{"stage":"download_model","progress_pct":0}'
 
-# Warm the weights into the HF cache now (rather than on the user's first
-# synth) so the start_server port check reflects a genuinely ready model.
-# We can't get a clean byte-level percentage out of HF's downloader here,
-# so we report 0 → 100 around the load; the stage label is the primary
-# signal (with_progress is a UX nicety, same as the comfyui-flux app).
+# Warm the default (multilingual) weights into the HF cache now rather than on
+# the user's first synth, so the start_server port check reflects a genuinely
+# ready model. We can't get a clean byte-level percentage out of HF's
+# downloader here, so we report 0 → 100 around the load.
 #
-# The warm script is written to a file and run via `if ! ...; then` rather
-# than the `set +e; cmd; status=$?` pattern: commands in an `if` condition
-# are exempt from errexit AND the ERR trap, so this reliably captures a
-# failure (the set+e pattern lets the global ERR trap misfire on some bash
-# builds). Output is teed to a log so the real traceback surfaces in the UI
-# failure message — no SSH needed to diagnose.
-WARM_FILE="${APP_DIR}/warm_${ENGINE}.py"
+# Run via `if ! ...; then` (commands in an `if` condition are exempt from
+# errexit AND the ERR trap) so we reliably capture the real traceback and
+# surface it in the failure message — no SSH needed to diagnose.
+WARM_FILE="${APP_DIR}/warm_model.py"
 WARM_LOG="/var/log/cc-tts-warm.log"
 
-case "$ENGINE" in
-    xtts-v2)
-        cat > "$WARM_FILE" <<'PYEOF'
-from TTS.api import TTS
-# Constructing the model downloads + caches the XTTS-v2 checkpoint.
-TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-print("xtts-v2 weights cached")
-PYEOF
-        ;;
-    chatterbox)
-        cat > "$WARM_FILE" <<'PYEOF'
+cat > "$WARM_FILE" <<'PYEOF'
 import torch
+from chatterbox import ChatterboxMultilingualTTS
 
-# See app.py: resemble-perth can resolve PerthImplicitWatermarker to None,
-# crashing chatterbox's constructor. Shim a no-op watermarker when broken.
-import perth
-if getattr(perth, "PerthImplicitWatermarker", None) is None:
-    class _NoopWatermarker:
-        def apply_watermark(self, wav, sample_rate=None, **kwargs):
-            return wav
-
-        def get_watermark(self, *args, **kwargs):
-            return None
-
-    perth.PerthImplicitWatermarker = _NoopWatermarker
-
-from chatterbox.tts import ChatterboxTTS
 dev = "cuda" if torch.cuda.is_available() else "cpu"
-ChatterboxTTS.from_pretrained(device=dev)
-print("chatterbox weights cached")
+# Constructing the model downloads + caches the multilingual checkpoint.
+ChatterboxMultilingualTTS.from_pretrained(device=dev)
+print("chatterbox-multilingual weights cached")
 PYEOF
-        ;;
-    f5-tts)
-        cat > "$WARM_FILE" <<'PYEOF'
-# F5-TTS lazily fetches weights from HF on first synthesis. Pre-pull the
-# default model so the user's first generation isn't a cold download.
-try:
-    from huggingface_hub import snapshot_download
-    snapshot_download("SWivid/F5-TTS")
-    print("f5-tts weights cached")
-except Exception as e:
-    # Non-fatal: the bundled UI will fetch on demand if this misses.
-    print(f"f5-tts pre-pull skipped: {e}")
-PYEOF
-        ;;
-esac
 
 if ! "$PY" "$WARM_FILE" > "$WARM_LOG" 2>&1; then
     log "model warm-load failed; tail of ${WARM_LOG}:"
     tail -n 20 "$WARM_LOG" 2>/dev/null || true
     tail_msg="$(tail -c 600 "$WARM_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')" || true
-    fail "Не удалось загрузить модель ${MODEL_DISPLAY_NAME}: ${tail_msg}"
+    fail "Не удалось загрузить модель Chatterbox Multilingual: ${tail_msg}"
 fi
 
 report_stage '{"stage":"download_model","progress_pct":100}'
@@ -388,28 +265,23 @@ CURRENT_STAGE="start_server"
 log "stage: start_server"
 report_stage '{"stage":"start_server"}'
 
-if [ "$ENGINE" = "f5-tts" ]; then
-    # F5-TTS's own Gradio app, from the venv's bin. --host/--port expose it
-    # on the mapped port.
-    nohup "${VENV_DIR}/bin/f5-tts_infer-gradio" --host 0.0.0.0 --port "$TTS_PORT" \
-        > /var/log/cc-tts.log 2>&1 &
-else
-    nohup "$PY" "$APP_FILE" > /var/log/cc-tts.log 2>&1 &
-fi
-SERVER_PID=$!
+# Run from the repo dir so the server finds config.yaml + static/ui assets.
+# It loads the model on startup (lifespan), but we pre-warmed the cache so
+# that's fast; the port-bind check below is the real ready gate.
+( cd "$APP_DIR" && nohup "$PY" server.py > /var/log/cc-tts.log 2>&1 & echo $! > "${APP_DIR}/.server.pid" )
+SERVER_PID="$(cat "${APP_DIR}/.server.pid" 2>/dev/null || echo '')"
 
-# Wait for Gradio to actually bind the port before reporting success.
-# If the process dies during model load (OOM, CUDA mismatch), bail early
-# with the tail of the log so the frontend surfaces a real error instead
-# of spinning on "preparing interface" forever.
-BIND_TIMEOUT_S=180
+# Wait for the server to actually answer HTTP before reporting success. If
+# the process dies during startup (OOM, CUDA mismatch), bail early with the
+# tail of the log so the frontend surfaces a real error instead of spinning.
+BIND_TIMEOUT_S=240
 for _ in $(seq 1 "$BIND_TIMEOUT_S"); do
-    if curl -fsS --max-time 1 "http://127.0.0.1:${TTS_PORT}/" >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 "http://127.0.0.1:${TTS_PORT}/" >/dev/null 2>&1; then
         report_stage '{"stage":"start_server","progress_pct":100}'
         log "provisioning complete"
         exit 0
     fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
         log "tts server exited before binding port ${TTS_PORT}"
         tail_msg="$(tail -c 500 /var/log/cc-tts.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')" || true
         fail "Сервис синтеза речи упал при запуске: ${tail_msg}"
