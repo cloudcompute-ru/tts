@@ -296,10 +296,19 @@ report_stage '{"stage":"download_model","progress_pct":0}'
 # We can't get a clean byte-level percentage out of HF's downloader here,
 # so we report 0 → 100 around the load; the stage label is the primary
 # signal (with_progress is a UX nicety, same as the comfyui-flux app).
-set +e
+#
+# The warm script is written to a file and run via `if ! ...; then` rather
+# than the `set +e; cmd; status=$?` pattern: commands in an `if` condition
+# are exempt from errexit AND the ERR trap, so this reliably captures a
+# failure (the set+e pattern lets the global ERR trap misfire on some bash
+# builds). Output is teed to a log so the real traceback surfaces in the UI
+# failure message — no SSH needed to diagnose.
+WARM_FILE="${APP_DIR}/warm_${ENGINE}.py"
+WARM_LOG="/var/log/cc-tts-warm.log"
+
 case "$ENGINE" in
     xtts-v2)
-        "$PY" - <<'PYEOF'
+        cat > "$WARM_FILE" <<'PYEOF'
 from TTS.api import TTS
 # Constructing the model downloads + caches the XTTS-v2 checkpoint.
 TTS("tts_models/multilingual/multi-dataset/xtts_v2")
@@ -307,7 +316,7 @@ print("xtts-v2 weights cached")
 PYEOF
         ;;
     chatterbox)
-        "$PY" - <<'PYEOF'
+        cat > "$WARM_FILE" <<'PYEOF'
 import torch
 from chatterbox.tts import ChatterboxTTS
 dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -316,7 +325,7 @@ print("chatterbox weights cached")
 PYEOF
         ;;
     f5-tts)
-        "$PY" - <<'PYEOF'
+        cat > "$WARM_FILE" <<'PYEOF'
 # F5-TTS lazily fetches weights from HF on first synthesis. Pre-pull the
 # default model so the user's first generation isn't a cold download.
 try:
@@ -329,11 +338,12 @@ except Exception as e:
 PYEOF
         ;;
 esac
-warm_status=$?
-set -e
 
-if [ "$warm_status" -ne 0 ]; then
-    fail "Не удалось скачать веса модели ${MODEL_DISPLAY_NAME}. Удалите этот инстанс и попробуйте снова или выберите другую модель."
+if ! "$PY" "$WARM_FILE" > "$WARM_LOG" 2>&1; then
+    log "model warm-load failed; tail of ${WARM_LOG}:"
+    tail -n 20 "$WARM_LOG" 2>/dev/null || true
+    tail_msg="$(tail -c 600 "$WARM_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')" || true
+    fail "Не удалось загрузить модель ${MODEL_DISPLAY_NAME}: ${tail_msg}"
 fi
 
 report_stage '{"stage":"download_model","progress_pct":100}'
@@ -367,7 +377,7 @@ for _ in $(seq 1 "$BIND_TIMEOUT_S"); do
     fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         log "tts server exited before binding port ${TTS_PORT}"
-        tail_msg="$(tail -c 500 /var/log/cc-tts.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        tail_msg="$(tail -c 500 /var/log/cc-tts.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')" || true
         fail "Сервис синтеза речи упал при запуске: ${tail_msg}"
     fi
     sleep 1
