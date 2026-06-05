@@ -25,6 +25,16 @@
 #
 # stdout/stderr go to /var/log/cc-provision.log (the onstart wrapper sets
 # this up via `nohup ... > /var/log/cc-provision.log 2>&1 &`).
+#
+# IMPORTANT — Python isolation
+# ----------------------------
+# We deliberately do NOT use the base image's `python3`. Vast.ai's
+# `jupyter-pytorch` template floats its tag and has shipped images as new as
+# Python 3.14 / CUDA 13.2, for which coqui-tts / torch have no wheels (the
+# install then fails or tries to build from source for ~forever). To stay
+# decoupled from whatever the host pulled, we create our own venv pinned to
+# Python 3.11 via `uv` (which downloads a standalone CPython), and install +
+# run everything inside it.
 
 set -euo pipefail
 
@@ -40,7 +50,12 @@ MODEL_DISPLAY_NAME="${CC_MODEL_DISPLAY_NAME:-$ENGINE}"
 TTS_PORT="${TTS_PORT:-7860}"
 APP_DIR="${APP_DIR:-/workspace/cc-tts}"
 APP_FILE="${APP_DIR}/app.py"
-VENV_MARKER="${APP_DIR}/.installed-${ENGINE}"
+VENV_DIR="${APP_DIR}/venv"
+PYVERSION="${CC_TTS_PYTHON_VERSION:-3.11}"
+
+# Pinned venv interpreter. Populated by setup_python; every install/run below
+# goes through this, never the base image's python3.
+PY=""
 
 # XTTS-v2 weights are gated behind Coqui's CPML license prompt; agreeing
 # non-interactively is required for an unattended download. This only
@@ -49,6 +64,10 @@ export COQUI_TOS_AGREED=1
 # Keep the HF cache on the (large) workspace disk, not the small container
 # root, so big checkpoints don't fill / and crash the box.
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+
+# Tracks which stage we're in so the ERR trap can attribute a failure to the
+# right step in the customer-facing stepper.
+CURRENT_STAGE="install_runtime"
 
 # --- helpers --------------------------------------------------------------
 
@@ -74,6 +93,56 @@ report_stage() {
 
 log() {
     echo "[cc-provision] $*"
+}
+
+# fail <human-message>
+#
+# Report a fatal error against the current stage and exit non-zero. A
+# non-empty `message` on provision_state is the backend's signal to flip the
+# instance to ERROR immediately (Instance::hasApplicationProvisioningFailed),
+# so the user sees a real error instead of the stepper hanging until the
+# 30-min overall timeout.
+fail() {
+    local msg="$1"
+    log "FAILED at stage=${CURRENT_STAGE}: ${msg}"
+    # Escape backslashes and double quotes for safe JSON embedding.
+    local safe
+    safe="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/'"'"'/g')"
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"message\":\"${safe}\"}"
+    exit 1
+}
+
+# Any unhandled non-zero command under `set -e` lands here. Stages that do
+# their own error handling wrap the risky bit in `set +e ... set -e`, so this
+# trap only fires for genuinely unexpected failures.
+trap 'fail "Установка прервана на этапе ${CURRENT_STAGE}. Подробности в /var/log/cc-provision.log на инстансе."' ERR
+
+# setup_python
+#
+# Install uv (if absent) and create a Python ${PYVERSION} venv at $VENV_DIR.
+# uv downloads a standalone CPython, so we get a known-good interpreter no
+# matter what the base image ships. Sets global $PY to the venv python.
+setup_python() {
+    if ! command -v uv >/dev/null 2>&1; then
+        log "installing uv"
+        curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 \
+            || fail "Не удалось установить uv (менеджер Python). Проверьте сеть и попробуйте снова."
+        # uv installs to ~/.local/bin (or $XDG_BIN_HOME); make it visible now.
+        export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+    fi
+    command -v uv >/dev/null 2>&1 || fail "uv не найден в PATH после установки."
+
+    log "creating Python ${PYVERSION} venv at ${VENV_DIR}"
+    uv venv --python "${PYVERSION}" "${VENV_DIR}" \
+        || fail "Не удалось создать виртуальное окружение Python ${PYVERSION}."
+
+    PY="${VENV_DIR}/bin/python"
+    [ -x "$PY" ] || fail "Python из venv не найден: ${PY}"
+}
+
+# uvpip <pip-args...> — install into our pinned venv via uv's fast resolver.
+uvpip() {
+    uv pip install --python "$PY" "$@"
 }
 
 # write_app_py
@@ -161,33 +230,48 @@ mkdir -p "$APP_DIR" "$HF_HOME"
 
 # --- stage 1: install_runtime --------------------------------------------
 
+CURRENT_STAGE="install_runtime"
 log "stage: install_runtime (engine=${ENGINE}, preset=${MODEL_DISPLAY_NAME})"
 report_stage '{"stage":"install_runtime","progress_pct":0}'
 
 # System libs every engine needs: ffmpeg for audio I/O, libsndfile for
-# soundfile, git for pip VCS installs.
+# soundfile, git for pip VCS installs, curl for the uv installer.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y --no-install-recommends ffmpeg libsndfile1 git >/dev/null 2>&1 || true
+apt-get install -y --no-install-recommends ffmpeg libsndfile1 git curl >/dev/null 2>&1 || true
+
+report_stage '{"stage":"install_runtime","progress_pct":20}'
+
+# Pinned Python 3.11 venv (see header). Decouples us from the base image's
+# python, which may be 3.14 and wheel-less for torch / coqui-tts.
+setup_python
 
 report_stage '{"stage":"install_runtime","progress_pct":40}'
 
-# Engine-specific Python deps. Each install is idempotent; pip skips already
-# satisfied requirements on a re-run.
-pip install --no-cache-dir -U pip >/dev/null 2>&1 || true
+# Torch first, from the official CUDA 12.4 wheel index. Newer NVIDIA drivers
+# (incl. the CUDA 13.x hosts) run cu124 runtime fine via backward compat, and
+# cu124 has stable py311 wheels for every engine below.
+uvpip torch torchaudio --index-url https://download.pytorch.org/whl/cu124 \
+    || fail "Не удалось установить PyTorch. Удалите инстанс и попробуйте другой сервер."
+
+report_stage '{"stage":"install_runtime","progress_pct":60}'
+
+# Engine-specific Python deps.
 case "$ENGINE" in
     xtts-v2)
         # `coqui-tts` is the maintained community fork of the (archived)
         # original Coqui `TTS` package; same `from TTS.api import TTS`.
-        pip install --no-cache-dir "coqui-tts>=0.24" "gradio>=4.44,<6" soundfile
+        uvpip "coqui-tts>=0.24" "gradio>=4.44,<6" soundfile \
+            || fail "Не удалось установить движок XTTS-v2. Удалите инстанс и попробуйте снова."
         ;;
     f5-tts)
-        # F5-TTS ships its own Gradio app (`f5-tts_infer-gradio`); pulling
-        # the package also pulls a compatible gradio.
-        pip install --no-cache-dir f5-tts
+        # F5-TTS ships its own Gradio app (`f5-tts_infer-gradio`).
+        uvpip f5-tts \
+            || fail "Не удалось установить движок F5-TTS. Удалите инстанс и попробуйте снова."
         ;;
     chatterbox)
-        pip install --no-cache-dir chatterbox-tts "gradio>=4.44,<6" soundfile
+        uvpip chatterbox-tts "gradio>=4.44,<6" soundfile \
+            || fail "Не удалось установить движок Chatterbox. Удалите инстанс и попробуйте снова."
         ;;
 esac
 
@@ -199,11 +283,11 @@ if [ "$ENGINE" != "f5-tts" ]; then
     write_app_py
 fi
 
-touch "$VENV_MARKER"
 report_stage '{"stage":"install_runtime","progress_pct":100}'
 
 # --- stage 2: download_model ---------------------------------------------
 
+CURRENT_STAGE="download_model"
 log "stage: download_model"
 report_stage '{"stage":"download_model","progress_pct":0}'
 
@@ -215,7 +299,7 @@ report_stage '{"stage":"download_model","progress_pct":0}'
 set +e
 case "$ENGINE" in
     xtts-v2)
-        python3 - <<'PYEOF'
+        "$PY" - <<'PYEOF'
 from TTS.api import TTS
 # Constructing the model downloads + caches the XTTS-v2 checkpoint.
 TTS("tts_models/multilingual/multi-dataset/xtts_v2")
@@ -223,7 +307,7 @@ print("xtts-v2 weights cached")
 PYEOF
         ;;
     chatterbox)
-        python3 - <<'PYEOF'
+        "$PY" - <<'PYEOF'
 import torch
 from chatterbox.tts import ChatterboxTTS
 dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -232,7 +316,7 @@ print("chatterbox weights cached")
 PYEOF
         ;;
     f5-tts)
-        python3 - <<'PYEOF'
+        "$PY" - <<'PYEOF'
 # F5-TTS lazily fetches weights from HF on first synthesis. Pre-pull the
 # default model so the user's first generation isn't a cold download.
 try:
@@ -249,24 +333,24 @@ warm_status=$?
 set -e
 
 if [ "$warm_status" -ne 0 ]; then
-    log "model warm-load failed with exit $warm_status"
-    report_stage "{\"stage\":\"download_model\",\"message\":\"Не удалось скачать веса модели ${MODEL_DISPLAY_NAME}. Удалите этот инстанс и попробуйте снова или выберите другую модель.\"}"
-    exit "$warm_status"
+    fail "Не удалось скачать веса модели ${MODEL_DISPLAY_NAME}. Удалите этот инстанс и попробуйте снова или выберите другую модель."
 fi
 
 report_stage '{"stage":"download_model","progress_pct":100}'
 
 # --- stage 3: start_server -----------------------------------------------
 
+CURRENT_STAGE="start_server"
 log "stage: start_server"
 report_stage '{"stage":"start_server"}'
 
 if [ "$ENGINE" = "f5-tts" ]; then
-    # F5-TTS's own Gradio app. --host/--port expose it on the mapped port.
-    nohup f5-tts_infer-gradio --host 0.0.0.0 --port "$TTS_PORT" \
+    # F5-TTS's own Gradio app, from the venv's bin. --host/--port expose it
+    # on the mapped port.
+    nohup "${VENV_DIR}/bin/f5-tts_infer-gradio" --host 0.0.0.0 --port "$TTS_PORT" \
         > /var/log/cc-tts.log 2>&1 &
 else
-    nohup python3 "$APP_FILE" > /var/log/cc-tts.log 2>&1 &
+    nohup "$PY" "$APP_FILE" > /var/log/cc-tts.log 2>&1 &
 fi
 SERVER_PID=$!
 
@@ -284,12 +368,9 @@ for _ in $(seq 1 "$BIND_TIMEOUT_S"); do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         log "tts server exited before binding port ${TTS_PORT}"
         tail_msg="$(tail -c 500 /var/log/cc-tts.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
-        report_stage "{\"stage\":\"start_server\",\"message\":\"Сервис синтеза речи упал при запуске: ${tail_msg}\"}"
-        exit 1
+        fail "Сервис синтеза речи упал при запуске: ${tail_msg}"
     fi
     sleep 1
 done
 
-log "tts server did not bind port ${TTS_PORT} within ${BIND_TIMEOUT_S}s"
-report_stage "{\"stage\":\"start_server\",\"message\":\"Веб-интерфейс не запустился за ${BIND_TIMEOUT_S}с. Смотрите /var/log/cc-tts.log на инстансе.\"}"
-exit 1
+fail "Веб-интерфейс не запустился за ${BIND_TIMEOUT_S}с. Смотрите /var/log/cc-tts.log на инстансе."
