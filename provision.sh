@@ -169,6 +169,26 @@ REF_HINT = (
 if ENGINE == "chatterbox":
     import torch
     import torchaudio
+
+    # chatterbox hard-calls perth.PerthImplicitWatermarker() in its
+    # constructor, but resemble-perth resolves that class to None in some
+    # environments (its __init__ swallows an internal import error), which
+    # crashes from_pretrained with "'NoneType' object is not callable".
+    # Watermarking is provenance-only and irrelevant for a rent-the-GPU
+    # product (the customer runs their own generation), so fall back to a
+    # no-op watermarker when perth is broken. Guarded so a working perth is
+    # still used if present.
+    import perth
+    if getattr(perth, "PerthImplicitWatermarker", None) is None:
+        class _NoopWatermarker:
+            def apply_watermark(self, wav, sample_rate=None, **kwargs):
+                return wav
+
+            def get_watermark(self, *args, **kwargs):
+                return None
+
+        perth.PerthImplicitWatermarker = _NoopWatermarker
+
     from chatterbox.tts import ChatterboxTTS
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -318,6 +338,20 @@ PYEOF
     chatterbox)
         cat > "$WARM_FILE" <<'PYEOF'
 import torch
+
+# See app.py: resemble-perth can resolve PerthImplicitWatermarker to None,
+# crashing chatterbox's constructor. Shim a no-op watermarker when broken.
+import perth
+if getattr(perth, "PerthImplicitWatermarker", None) is None:
+    class _NoopWatermarker:
+        def apply_watermark(self, wav, sample_rate=None, **kwargs):
+            return wav
+
+        def get_watermark(self, *args, **kwargs):
+            return None
+
+    perth.PerthImplicitWatermarker = _NoopWatermarker
+
 from chatterbox.tts import ChatterboxTTS
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 ChatterboxTTS.from_pretrained(device=dev)
