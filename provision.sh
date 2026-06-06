@@ -111,6 +111,18 @@ log() {
     echo "[cc-provision] $*"
 }
 
+# report_log <short-status-line>
+#
+# Best-effort POST of a single live status line shown under the active
+# stage's progress bar in the customer dashboard. Ephemeral — replaced on
+# every call, cleared on stage transitions. 200 chars max.
+report_log() {
+    local line="$1"
+    local safe
+    safe="$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/'"'"'/g')"
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"log_line\":\"${safe}\"}"
+}
+
 # fail <human-message>
 #
 # Report a fatal error against the current stage and exit non-zero. A
@@ -210,6 +222,7 @@ apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y --no-install-recommends ffmpeg libsndfile1 git curl >/dev/null 2>&1 || true
 
 report_stage '{"stage":"install_runtime","progress_pct":15}'
+report_log "system deps installed (ffmpeg, libsndfile1)"
 
 # Clone the server fork at its pinned commit FIRST (before the venv, which
 # lives inside $APP_DIR — git clone needs an empty target). A floating tag
@@ -217,21 +230,25 @@ report_stage '{"stage":"install_runtime","progress_pct":15}'
 clone_server
 
 report_stage '{"stage":"install_runtime","progress_pct":25}'
+report_log "Chatterbox-TTS-Server cloned"
 
 # Pinned Python 3.10 venv (see header). Decouples us from the base image's
 # python, which may be 3.14 and wheel-less for torch / onnx.
 setup_python
 
 report_stage '{"stage":"install_runtime","progress_pct":35}'
+report_log "Python 3.10 venv ready"
 
 # CUDA torch stack first, from the cu128 wheel set (torch 2.9.0). cu128
 # covers Turing→Blackwell (incl. RTX 50-series, sm_120) in one wheel set;
 # newer Vast hosts run it fine via driver forward-compat. pip reads the
 # --extra-index-url pin from the requirements file natively.
+report_log "installing torch+CUDA (cu128)…"
 "$PIP" install --no-warn-script-location -r "${APP_DIR}/requirements-nvidia-cu128.txt" \
     || fail "Не удалось установить зависимости (PyTorch CUDA). Удалите инстанс и попробуйте другой сервер."
 
 report_stage '{"stage":"install_runtime","progress_pct":65}'
+report_log "torch installed; installing Chatterbox…"
 
 # Chatterbox model package + s3tokenizer + onnx with --no-deps so pip can't
 # replace the cu128 torch wheels with CPU-only ones (s3tokenizer/onnx are
@@ -272,6 +289,7 @@ except Exception:
 PYEOF
 
 report_stage '{"stage":"install_runtime","progress_pct":85}'
+report_log "dependencies installed; configuring engine…"
 
 # Point the server at the multilingual engine + Russian default. These are
 # the only two values we override in the shipped config.yaml; everything else
@@ -286,6 +304,7 @@ report_stage '{"stage":"install_runtime","progress_pct":100}'
 CURRENT_STAGE="download_model"
 log "stage: download_model"
 report_stage '{"stage":"download_model","progress_pct":0}'
+report_log "warming Chatterbox Multilingual weights…"
 
 # Warm the default (multilingual) weights into the HF cache now rather than on
 # the user's first synth, so the start_server port check reflects a genuinely
@@ -322,6 +341,7 @@ report_stage '{"stage":"download_model","progress_pct":100}'
 CURRENT_STAGE="start_server"
 log "stage: start_server"
 report_stage '{"stage":"start_server"}'
+report_log "starting Chatterbox-TTS-Server on port ${TTS_PORT}…"
 
 # Run from the repo dir so the server finds config.yaml + static/ui assets.
 # It loads the model on startup (lifespan), but we pre-warmed the cache so
