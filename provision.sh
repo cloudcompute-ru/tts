@@ -123,6 +123,23 @@ report_log() {
     report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"log_line\":\"${safe}\"}"
 }
 
+# send_log_tail
+#
+# Best-effort POST of the last 200 lines of /var/log/cc-provision.log as
+# the `log_tail` field on provision_state. Persists across subsequent stage
+# updates (sticky-merged on the backend) so the Provision Log tab in the
+# dashboard always shows the most recent snapshot. Uses system python3 for
+# correct JSON encoding — safe to call before $PY / $PIP are set up.
+send_log_tail() {
+    if [ -z "$CC_PROVISION_URL" ] || [ -z "$CC_AGENT_TOKEN" ]; then return 0; fi
+    local encoded
+    encoded="$(tail -n 200 /var/log/cc-provision.log 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' \
+        2>/dev/null)" || return 0
+    [ -z "$encoded" ] && return 0
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"log_tail\":${encoded}}"
+}
+
 # fail <human-message>
 #
 # Report a fatal error against the current stage and exit non-zero. A
@@ -136,7 +153,11 @@ fail() {
     # Escape backslashes and double quotes for safe JSON embedding.
     local safe
     safe="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/'"'"'/g')"
-    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"message\":\"${safe}\"}"
+    local log_tail_enc
+    log_tail_enc="$(tail -n 100 /var/log/cc-provision.log 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' \
+        2>/dev/null || echo 'null')"
+    report_stage "{\"stage\":\"${CURRENT_STAGE}\",\"message\":\"${safe}\",\"log_tail\":${log_tail_enc}}"
     exit 1
 }
 
@@ -144,6 +165,39 @@ fail() {
 # their own error handling wrap the risky bit in an `if` (exempt from errexit
 # AND this trap), so the trap only fires for genuinely unexpected failures.
 trap 'fail "Установка прервана на этапе ${CURRENT_STAGE}. Подробности в /var/log/cc-provision.log на инстансе."' ERR
+
+# run_user_hook <stage-id>
+#
+# Runs the customer-supplied setup script, if any. MUST be called AFTER our
+# install steps but immediately BEFORE the app server starts, so anything the
+# script installs (pip packages, model weights, extra repos) is on disk for the
+# server's first and only boot — no restart needed.
+#
+# The script arrives base64-encoded in CC_USER_SETUP_B64 (base64 sidesteps all
+# shell-quoting hazards). Its stdout/stderr lands in /var/log/cc-provision.log,
+# so it shows up in the dashboard log tail. A non-zero exit aborts provisioning
+# and surfaces the failure to the wizard.
+run_user_hook() {
+    [ -n "${CC_USER_SETUP_B64:-}" ] || return 0
+    _stage="${1:-start_server}"
+    log "running custom setup script"
+    report_stage "{\"stage\":\"${_stage}\",\"message\":\"running custom setup script\"}"
+    if ! printf '%s' "$CC_USER_SETUP_B64" | base64 -d > /tmp/cc-user-setup.sh 2>/dev/null; then
+        log "could not decode CC_USER_SETUP_B64; skipping custom setup"
+        return 0
+    fi
+    chmod +x /tmp/cc-user-setup.sh
+    set +e
+    bash /tmp/cc-user-setup.sh 2>&1 | sed 's/^/[user-setup] /'
+    _rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$_rc" -ne 0 ]; then
+        _tail="$(tail -c 400 /var/log/cc-provision.log 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/"/'"'"'/g')"
+        report_stage "{\"stage\":\"${_stage}\",\"message\":\"custom setup script failed (exit ${_rc}): ${_tail}\"}"
+        exit "$_rc"
+    fi
+    log "custom setup script finished"
+}
 
 # setup_python
 #
@@ -298,11 +352,13 @@ sed -i 's#^\([[:space:]]*\)repo_id:.*#\1repo_id: '"$DEFAULT_MODEL"'#' "${APP_DIR
 sed -i 's#^\([[:space:]]*\)language: en\b#\1language: '"$DEFAULT_LANGUAGE"'#' "${APP_DIR}/config.yaml" || true
 
 report_stage '{"stage":"install_runtime","progress_pct":100}'
+send_log_tail
 
 # --- stage 2: download_model ---------------------------------------------
 
 CURRENT_STAGE="download_model"
 log "stage: download_model"
+send_log_tail
 report_stage '{"stage":"download_model","progress_pct":0}'
 report_log "warming Chatterbox Multilingual weights…"
 
@@ -335,12 +391,20 @@ if ! "$PY" "$WARM_FILE" > "$WARM_LOG" 2>&1; then
 fi
 
 report_stage '{"stage":"download_model","progress_pct":100}'
+send_log_tail
 
 # --- stage 3: start_server -----------------------------------------------
 
 CURRENT_STAGE="start_server"
 log "stage: start_server"
+send_log_tail
 report_stage '{"stage":"start_server"}'
+
+# Custom setup runs here — the TTS engine + weights are installed, but the
+# server hasn't started, so anything the script installs is present for the
+# single launch below.
+run_user_hook "start_server"
+
 report_log "starting Chatterbox-TTS-Server on port ${TTS_PORT}…"
 
 # Run from the repo dir so the server finds config.yaml + static/ui assets.
@@ -355,6 +419,7 @@ SERVER_PID="$(cat "${APP_DIR}/.server.pid" 2>/dev/null || echo '')"
 BIND_TIMEOUT_S=240
 for _ in $(seq 1 "$BIND_TIMEOUT_S"); do
     if curl -fsS --max-time 2 "http://127.0.0.1:${TTS_PORT}/" >/dev/null 2>&1; then
+        send_log_tail
         report_stage '{"stage":"start_server","progress_pct":100}'
         log "provisioning complete"
         exit 0
